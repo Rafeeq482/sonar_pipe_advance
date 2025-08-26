@@ -1,0 +1,5 @@
+---
+- hosts: all            # keep as 'all' because inventory will be dynamic
+  become: yes
+  roles:
+    - sonarqube
