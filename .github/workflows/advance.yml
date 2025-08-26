@@ -1,0 +1,115 @@
+name: Advanced SonarQube One-Click Pipeline
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sonarqube:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq ansible awscli unzip default-jre
+
+      # ---- 1. Provision High-Powered EC2 with Terraform ----
+      - name: Terraform Init & Apply (High Instance)
+        run: |
+          cd terraform/
+          terraform init
+          terraform apply -auto-approve -var "instance_type=t3.large"
+          INSTANCE_ID=$(terraform output -raw instance_id)
+          INSTANCE_IP=$(terraform output -raw public_ip)
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+          echo "INSTANCE_IP=$INSTANCE_IP" >> $GITHUB_ENV
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ap-south-1
+
+      # ---- 2. Install SonarQube via Ansible ----
+      - name: Ansible Install SonarQube
+        run: ansible-playbook -i ${INSTANCE_IP}, ansible/install-sonarqube.yml
+
+      # ---- 3. Wait for SonarQube to be healthy ----
+      - name: Wait for SonarQube to start
+        run: |
+          for i in {1..40}; do
+            if curl -fsS "http://${INSTANCE_IP}:9000/api/system/health" | grep -q '"status":"GREEN"'; then
+              echo "SonarQube is up and healthy."
+              break
+            fi
+            echo "Waiting for SonarQube... ($i/40)"
+            sleep 10
+          done
+
+      # ---- 4. Generate Sonar Token ----
+      - name: Generate Sonar Token
+        run: |
+          SONAR_TOKEN=$(curl -u admin:admin -X POST "http://${INSTANCE_IP}:9000/api/user_tokens/generate?name=pipeline-token" | jq -r .token)
+          echo "SONAR_TOKEN=$SONAR_TOKEN" >> $GITHUB_ENV
+
+      # ---- 5. Clone Private Repo for Scanning ----
+      - name: Clone Private Repo (PAT)
+        env:
+          TARGET_REPO: ${{ vars.TARGET_REPO || github.repository }}
+          TARGET_BRANCH: ${{ vars.TARGET_BRANCH || github.ref_name }}
+          TOKEN: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          mkdir -p /tmp/target && cd /tmp
+          git clone --branch "$TARGET_BRANCH" "https://${TOKEN}:x-oauth-basic@github.com/${TARGET_REPO}.git" target
+          cd target
+          git rev-parse --short HEAD
+
+      # ---- 6. Install SonarScanner on Runner ----
+      - name: Install Sonar Scanner
+        run: |
+          SCAN_VER="5.0.1.3006"
+          curl -L -o sonar-scanner.zip "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SCAN_VER}-linux.zip"
+          unzip sonar-scanner.zip
+          echo "${PWD}/sonar-scanner-${SCAN_VER}-linux/bin" >> $GITHUB_PATH
+
+      # ---- 7. Run Sonar Scanner Using Existing sonar-project.properties ----
+      - name: Run Sonar Scanner
+        working-directory: /tmp/target
+        env:
+          INSTANCE_IP: ${{ env.INSTANCE_IP }}
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+        run: |
+          sonar-scanner \
+            -Dsonar.host.url=http://${INSTANCE_IP}:9000 \
+            -Dsonar.login=${SONAR_TOKEN}
+
+      # ---- 8. Create AMI of Configured Instance ----
+      - name: Create AMI from High Instance
+        run: |
+          AMI_ID=$(aws ec2 create-image --instance-id $INSTANCE_ID --name "sonar-ami-$(date +%Y%m%d%H%M)" --query 'ImageId' --output text)
+          echo "AMI_ID=$AMI_ID" >> $GITHUB_ENV
+          aws ec2 wait image-available --image-ids $AMI_ID
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ap-south-1
+
+      # ---- 9. Terminate High Instance ----
+      - name: Terminate High Instance
+        run: aws ec2 terminate-instances --instance-ids $INSTANCE_ID
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ap-south-1
+
+      # ---- 10. Launch Micro Instance from AMI ----
+      - name: Launch t2.micro Instance from AMI
+        run: |
+          MICRO_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type t2.micro --key-name $TF_VAR_key_name --security-group-ids <SG_ID> --subnet-id <SUBNET_ID> --query 'Instances[0].InstanceId' --output text)
+          MICRO_IP=$(aws ec2 describe-instances --instance-ids $MICRO_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "MICRO_IP=$MICRO_IP"
+          echo "SonarQube Dashboard is live at: http://${MICRO_IP}:9000"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ap-south-1
