@@ -1,6 +1,5 @@
 ---
 - name: Install and Configure SonarQube
-  hosts: all
   become: true
   vars:
     sonar_user: sonarqube
