@@ -94,10 +94,18 @@ jobs:
           echo "NEW_INSTANCE_IP=$NEW_INSTANCE_IP" >> $GITHUB_ENV
           echo "SonarQube Dashboard is now available at: http://$NEW_INSTANCE_IP:9000"
 
-    # 11. Cleanup if failure occurs
-    cleanup:
-      if: failure()
-      runs-on: ubuntu-latest
-      steps:
-        - name: Destroy Resources on Failure
-          run: terraform -chdir=terraform destroy -auto-approve
+      # If any step above fails, this step runs and destroys infra
+      - name: Cleanup (destroy) on failure
+        if: failure()
+        working-directory: terraform
+        run: |
+          echo "Pipeline failed — destroying AWS resources..."
+          terraform destroy -auto-approve
+
+      # Also destroy if workflow is canceled
+      - name: Cleanup (destroy) on cancel
+        if: cancelled()
+        working-directory: terraform
+        run: |
+          echo "Pipeline cancelled — destroying AWS resources..."
+          terraform destroy -auto-approve
