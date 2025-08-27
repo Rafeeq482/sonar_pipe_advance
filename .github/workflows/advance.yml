@@ -1,90 +1,80 @@
-name: SonarQube Deployment & Scan
+name: SonarQube Deployment Pipeline
 
 on:
+  workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
-  deploy-sonarqube:
+  deploy:
     runs-on: ubuntu-latest
+
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ap-south-1
       TF_VAR_key_name: ${{ secrets.TF_VAR_KEY_NAME }}
+
     steps:
-      - name: Checkout Code
+      - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq ansible python3-psycopg2
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
+      # Install dependencies
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.6.5
-          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-          terraform_wrapper: false
 
+      - name: Install Ansible and dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ansible jq python3-psycopg2
+
+      # Terraform Init & Apply
       - name: Terraform Init
-        run: terraform init
         working-directory: terraform
+        run: terraform init
 
       - name: Terraform Apply
-        id: tf_apply
+        working-directory: terraform
         run: terraform apply -auto-approve
+
+      # Capture instance IP output from Terraform
+      - name: Get Instance IP
+        id: get_ip
         working-directory: terraform
-
-      - name: Get SonarQube instance IP
         run: |
-            IP=$(terraform output -raw sonarqube_public_ip)
-            echo "INSTANCE_IP=$IP" >> $GITHUB_ENV
+          IP=$(terraform output -raw sonarqube_public_ip)
+          echo "INSTANCE_IP=$IP" >> $GITHUB_ENV
+          echo "Instance IP: $IP"
 
-        working-directory: terraform
-
-      - name: Add SSH Key
+      # Configure SSH Key from secret
+      - name: Setup SSH Key
         run: |
-          echo "${{ secrets.NEWACC_PRIVATE_KEY }}" > SNS.pem
-          chmod 600 SNS.pem
+          echo "${{ secrets.NEWACC_PRIVATE_KEY }}" > key.pem
+          chmod 600 key.pem
 
-      - name: Wait for SSH to be ready
+      # Wait for instance SSH to be ready
+      - name: Wait for SSH
         run: |
-          for i in {1..15}; do
-            ssh -o StrictHostKeyChecking=no -i SNS.pem ubuntu@$INSTANCE_IP "echo connected" && break
-            echo "Waiting for instance to be ready..."
+          for i in {1..12}; do
+            ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@$INSTANCE_IP "echo 'SSH OK'" && break
+            echo "Waiting for SSH..."
             sleep 20
           done
 
-      - name: Run Ansible Playbook (Install SonarQube)
-        run: |
-          ansible-playbook -i "$INSTANCE_IP," --private-key SNS.pem ansible/install-sonarqube.yml
+      # Run Ansible playbook
+      - name: Run Ansible Playbook
+        run: ansible-playbook -i "${INSTANCE_IP}," --private-key key.pem ansible/install-sonarqube.yml
 
-      - name: Wait for SonarQube to start
-        run: |
-          echo "Waiting for SonarQube to start..."
-          for i in {1..15}; do
-            curl -s http://$INSTANCE_IP:9000/api/system/status | grep -q '"status":"UP"' && break
-            sleep 10
-          done
-
-      - name: Create SonarQube Token (Runtime)
-        id: create_token
-        run: |
-          # Create admin token dynamically via API
-          TOKEN_RESPONSE=$(curl -s -u admin:admin -X POST "http://$INSTANCE_IP:9000/api/user_tokens/generate" -d "name=gh_token_$(date +%s)")
-          SONAR_TOKEN=$(echo $TOKEN_RESPONSE | jq -r '.token')
-          echo "SONAR_TOKEN=$SONAR_TOKEN" >> $GITHUB_ENV
-          echo "Generated token: $SONAR_TOKEN"
-
+      # Example SonarQube Scan step (after deployment)
       - name: Run SonarQube Scan
-        run: |
-          docker run --rm \
-            -e SONAR_HOST_URL="http://$INSTANCE_IP:9000" \
-            -e SONAR_LOGIN="$SONAR_TOKEN" \
-            -v "$(pwd):/usr/src" sonarsource/sonar-scanner-cli
+        uses: SonarSource/sonarcloud-github-action@master
+        with:
+          projectBaseDir: .
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: http://$INSTANCE_IP:9000
 
       # Cleanup on failure
       - name: Cleanup (destroy) on failure
