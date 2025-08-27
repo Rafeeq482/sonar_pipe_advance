@@ -1,100 +1,77 @@
-name: Advanced SonarQube Pipeline with Cost Optimization
+name: Deploy SonarQube with Terraform and Ansible
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: ap-south-1
+  TF_VAR_key_name: ${{ secrets.AWS_KEY_NAME }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
 jobs:
-  sonarqube-pipeline:
+  deploy:
     runs-on: ubuntu-latest
-    env:
-      AWS_REGION: ap-south-1
-      TF_WORKSPACE: default
 
     steps:
-      # 1. Checkout Code
-      - name: Checkout Repo
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. Configure AWS Credentials
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      # 3. Setup Terraform
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.6.5
+          cli_config_credentials_hostname: app.terraform.io
+          terraform_wrapper: false
 
-      # 4. Terraform Init & Apply (High-tier EC2)
       - name: Terraform Init
-        run: terraform -chdir=terraform init
+        working-directory: terraform
+        run: terraform init
 
-      - name: Terraform Apply (High-tier Instance)
-        id: tf_apply
-        run: terraform -chdir=terraform apply -auto-approve
+      - name: Terraform Apply
+        id: apply
+        working-directory: terraform
+        run: terraform apply -auto-approve -input=false -no-color -json > tf_apply_output.json
 
-      # Capture outputs (Public IP, SG, Subnet)
       - name: Get Terraform Outputs
-        id: tf_outputs
+        id: tf_output
+        working-directory: terraform
         run: |
-          echo "INSTANCE_IP=$(terraform -chdir=terraform output -raw sonarqube_public_ip)" >> $GITHUB_ENV
-          echo "SG_ID=$(terraform -chdir=terraform output -raw security_group_id)" >> $GITHUB_ENV
-          echo "SUBNET_ID=$(terraform -chdir=terraform output -raw subnet_id)" >> $GITHUB_ENV
+          INSTANCE_IP=$(terraform output -raw sonarqube_public_ip)
+          echo "INSTANCE_IP=$INSTANCE_IP" >> $GITHUB_ENV
+          echo "SonarQube Public IP: $INSTANCE_IP"
 
-      # 5. Wait for SSH to be ready
-      - name: Wait for SSH
-        run: |
-          for i in {1..30}; do
-            if ssh -o StrictHostKeyChecking=no -i sonar-key.pem ubuntu@${INSTANCE_IP} "echo ok" 2>/dev/null; then
-              echo "SSH is ready!"
-              break
-            fi
-            echo "Waiting for SSH..."
-            sleep 10
-          done
-
-      # 6. Setup SSH Key
       - name: Setup SSH Key
         run: |
-          echo "${{ secrets.NEWACC_PRIVATE_KEY }}" > sonar-key.pem
-          chmod 600 sonar-key.pem
+          echo "${{ secrets.NEWACC_PRIVATE_KEY }}" > sns.pem
+          chmod 600 sns.pem
 
-      # 7. Run Ansible Playbook to Install SonarQube & Scan Code
-      - name: Install SonarQube & Scan
+      - name: Wait for SSH to be ready
         run: |
-          ansible-playbook -i "${INSTANCE_IP}," --private-key sonar-key.pem ansible/install-sonarqube.yml \
-            --extra-vars "repo_url=${{ secrets.PRIVATE_REPO_URL }} repo_key=${{ secrets.PRIVATE_REPO_KEY }}"
+          for i in {1..15}; do
+            if ssh -o StrictHostKeyChecking=no -i sns.pem ubuntu@${INSTANCE_IP} "echo connected"; then
+              echo "SSH is ready!"
+              exit 0
+            fi
+            echo "Waiting for SSH..."
+            sleep 15
+          done
+          echo "SSH failed to start after 4 minutes"
+          exit 1
 
-      # 8. Create AMI from High-tier Instance
-      - name: Create AMI
-        id: create_ami
+      - name: Run Ansible Playbook
         run: |
-          AMI_ID=$(aws ec2 create-image --instance-id $(terraform -chdir=terraform output -raw sonarqube_instance_id) --name "sonar-ami-$(date +%s)" --query 'ImageId' --output text)
-          echo "AMI_ID=$AMI_ID" >> $GITHUB_ENV
-          echo "Created AMI: $AMI_ID"
-          aws ec2 wait image-available --image-ids $AMI_ID
+          sudo apt-get update && sudo apt-get install -y ansible python3-psycopg2
+          ansible-playbook -i "${INSTANCE_IP}," -u ubuntu --private-key sns.pem ansible/install-sonarqube.yml
 
-      # 9. Destroy High-tier Instance
-      - name: Destroy High-tier Instance
-        run: terraform -chdir=terraform destroy -target=aws_instance.sonarqube -auto-approve
-
-      # 10. Launch t2.micro with Created AMI
-      - name: Launch Micro Instance
+      - name: Post SonarQube URL
         run: |
-          NEW_INSTANCE_ID=$(aws ec2 run-instances --image-id $AMI_ID --count 1 --instance-type t2.micro \
-            --security-group-ids $SG_ID --subnet-id $SUBNET_ID \
-            --query 'Instances[0].InstanceId' --output text)
-          echo "NEW_INSTANCE_ID=$NEW_INSTANCE_ID" >> $GITHUB_ENV
-          aws ec2 wait instance-running --instance-ids $NEW_INSTANCE_ID
-          NEW_INSTANCE_IP=$(aws ec2 describe-instances --instance-ids $NEW_INSTANCE_ID --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-          echo "NEW_INSTANCE_IP=$NEW_INSTANCE_IP" >> $GITHUB_ENV
-          echo "SonarQube Dashboard is now available at: http://$NEW_INSTANCE_IP:9000"
+            
+            echo "SonarQube deployed at: http://${INSTANCE_IP}:9000"
 
-      # If any step above fails, this step runs and destroys infra
+      # Cleanup on failure
       - name: Cleanup (destroy) on failure
         if: failure()
         working-directory: terraform
@@ -102,7 +79,7 @@ jobs:
           echo "Pipeline failed — destroying AWS resources..."
           terraform destroy -auto-approve
 
-      # Also destroy if workflow is canceled
+      # Cleanup on cancel
       - name: Cleanup (destroy) on cancel
         if: cancelled()
         working-directory: terraform
