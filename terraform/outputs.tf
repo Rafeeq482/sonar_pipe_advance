@@ -1,6 +1,5 @@
-output "sonarqube_public_ip" {
-  description = "Public IP of the SonarQube EC2 instance"
-  value       = aws_instance.sonarqube.public_ip
+output "instance_ip" {
+  value = aws_instance.sonarqube.public_ip
 }
 
 output "security_group_id" {
