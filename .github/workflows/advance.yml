@@ -39,7 +39,7 @@ jobs:
         working-directory: terraform
 
       - name: Get SonarQube instance IP
-         run: |
+        run: |
             IP=$(terraform output -raw sonarqube_public_ip)
             echo "INSTANCE_IP=$IP" >> $GITHUB_ENV
 
