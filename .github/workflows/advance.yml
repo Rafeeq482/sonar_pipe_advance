@@ -65,7 +65,7 @@ jobs:
 
       # Run Ansible playbook
       - name: Run Ansible Playbook
-        run: ansible-playbook -i "${INSTANCE_IP}," --private-key key.pem ansible/install-sonarqube.yml
+        run: ansible-playbook -i "${INSTANCE_IP}," --private-key key.pem --user ubuntu ansible/install-sonarqube.yml
 
       # Example SonarQube Scan step (after deployment)
       - name: Run SonarQube Scan
