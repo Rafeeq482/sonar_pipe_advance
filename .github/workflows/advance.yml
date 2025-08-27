@@ -45,13 +45,13 @@ jobs:
 
       - name: Setup SSH Key
         run: |
-          echo "${{ secrets.NEWACC_PRIVATE_KEY }}" > sns.pem
-          chmod 600 sns.pem
+          echo "${{ secrets.NEWACC_PRIVATE_KEY }}" > SNS.pem
+          chmod 600 SNS.pem
 
       - name: Wait for SSH to be ready
         run: |
           for i in {1..15}; do
-            if ssh -o StrictHostKeyChecking=no -i sns.pem ubuntu@${INSTANCE_IP} "echo connected"; then
+            if ssh -o StrictHostKeyChecking=no -i SNS.pem ubuntu@${INSTANCE_IP} "echo connected"; then
               echo "SSH is ready!"
               exit 0
             fi
@@ -64,7 +64,7 @@ jobs:
       - name: Run Ansible Playbook
         run: |
           sudo apt-get update && sudo apt-get install -y ansible python3-psycopg2
-          ansible-playbook -i "${INSTANCE_IP}," -u ubuntu --private-key sns.pem ansible/install-sonarqube.yml
+          ansible-playbook -i "${INSTANCE_IP}," -u ubuntu --private-key SNS.pem ansible/install-sonarqube.yml
 
       - name: Post SonarQube URL
         run: |
